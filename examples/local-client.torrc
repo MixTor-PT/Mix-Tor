@@ -1,0 +1,13 @@
+# Local Tor client using MixTor as a managed client transport.
+#
+# Build first:
+# cargo build --bins
+#
+# Then replace the path below if your checkout lives somewhere else.
+
+DataDirectory ./target/local-tor-client-data
+SocksPort 127.0.0.1:9050
+UseBridges 1
+ClientTransportPlugin mixtor exec C:\Users\Thanthal\Documents\Mixtor\target\debug\mixtor-client.exe
+Bridge mixtor 127.0.0.1:9001 EF571453EBA73FC10CA3D020817778BF0C6108B3
+Log notice stdout

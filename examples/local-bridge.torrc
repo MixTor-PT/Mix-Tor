@@ -1,0 +1,15 @@
+# Local test bridge daemon.
+#
+# Start this with a tor binary, then run mixtor-server in front of it:
+# mixtor-server --listen 127.0.0.1:9001 --upstream 127.0.0.1:9002
+
+DataDirectory ./target/local-tor-bridge-data
+SocksPort 0
+BridgeRelay 1
+ORPort 127.0.0.1:9002
+AssumeReachable 1
+PublishServerDescriptor 0
+ExitRelay 0
+Nickname mixtorlocal
+ContactInfo local-test
+Log notice stdout
