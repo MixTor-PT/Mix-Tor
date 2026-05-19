@@ -5,15 +5,26 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-/// Low-latency default bounds for packet clumping.
+/// Packet clumping defaults.
 ///
-/// These values intentionally create microclumps: enough aggregation to destroy
-/// one-packet-in/one-packet-out correspondence, short enough to avoid the long
-/// stalls that make interactive traffic miserable.
-pub const DEFAULT_MIN_PACKETS_PER_BURST: usize = 2;
-pub const DEFAULT_MAX_PACKETS_PER_BURST: usize = 7;
-pub const DEFAULT_MIN_TIMEOUT: Duration = Duration::from_millis(12);
-pub const DEFAULT_MAX_TIMEOUT: Duration = Duration::from_millis(85);
+/// Target: real burst size mean=2–4, std=1–2.
+///
+/// min_packets_per_burst=1: the pool flushes at whatever count actually
+/// accumulated — artificial forcing to ≥3 created uniform-looking bursts.
+/// Natural traffic variability (packet inter-arrival jitter) produces the
+/// std we want; we just need the timeout window to be wide enough.
+///
+/// Timeout 80–350 ms: at interactive rates (3–10 packets/s, inter-arrival
+/// 100–333 ms) this window accumulates 1–4 packets before flushing.
+/// The randomized range (not a fixed value) ensures no two cycles look alike.
+/// Latency impact: bounded at 350 ms worst case.
+///
+/// max_packets_per_burst=8: caps bursty upload/download sessions so the
+/// size trigger fires before the timeout, keeping throughput latency low.
+pub const DEFAULT_MIN_PACKETS_PER_BURST: usize = 1;
+pub const DEFAULT_MAX_PACKETS_PER_BURST: usize = 8;
+pub const DEFAULT_MIN_TIMEOUT: Duration = Duration::from_millis(80);
+pub const DEFAULT_MAX_TIMEOUT: Duration = Duration::from_millis(350);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Packet {
@@ -336,9 +347,14 @@ mod tests {
     fn creates_microclump_defaults() {
         let config = ClumpingConfig::default();
 
-        assert_eq!(config.min_packets_per_burst, 2);
-        assert_eq!(config.max_packets_per_burst, 7);
-        assert!(config.max_timeout <= Duration::from_millis(100));
+        assert_eq!(config.min_packets_per_burst, DEFAULT_MIN_PACKETS_PER_BURST);
+        assert_eq!(config.max_packets_per_burst, DEFAULT_MAX_PACKETS_PER_BURST);
+        // min=1: pool must be allowed to flush singletons (natural variability
+        // produces the burst-size std we want; forcing ≥3 flattens it).
+        assert_eq!(config.min_packets_per_burst, 1);
+        // Timeout must be wide enough to accumulate at interactive rates.
+        assert!(config.min_timeout >= Duration::from_millis(50));
+        assert!(config.max_timeout <= Duration::from_millis(500));
     }
 
     #[test]
@@ -449,6 +465,65 @@ mod tests {
         assert!(
             observed.len() > 1,
             "thresholds should vary across cycles to resist probing"
+        );
+    }
+
+    /// Timeout floor must be wide enough to allow multi-packet accumulation.
+    ///
+    /// Singletons are allowed (min_packets=1) but should not be the *only*
+    /// outcome.  A floor of 50ms ensures some accumulation at interactive
+    /// rates; the composition layer further masks singletons with leading
+    /// dummies so the wire frame is never exactly 1 packet.
+    #[test]
+    fn timeout_floor_allows_accumulation() {
+        assert!(
+            DEFAULT_MIN_TIMEOUT >= Duration::from_millis(50),
+            "minimum timeout {DEFAULT_MIN_TIMEOUT:?} is too short: \
+             pool will almost never accumulate multiple packets"
+        );
+    }
+
+    /// Burst size distribution must be variable at interactive packet rates.
+    ///
+    /// Target: some singletons (allowed), some multi-packet, std > 0.
+    /// Simulates mixed fast/slow inter-arrival to create natural variability.
+    #[test]
+    fn produces_variable_burst_sizes_at_interactive_rates() {
+        let seeds = SessionSeeds::generate().expect("seed generation should succeed");
+        let mut pool =
+            ClumpingPool::new(seeds.timing_and_pool()).expect("pool should initialize");
+
+        let mut all_bursts: Vec<Burst> = Vec::new();
+        let start = Instant::now();
+
+        // Mix of fast (100ms) and slow (300ms) inter-arrival to create
+        // natural size variability — some windows accumulate 2-3 packets,
+        // others flush as singletons.
+        let intervals = [100u64, 300, 100, 150, 300, 100, 200, 100, 300, 150,
+                         100, 300, 200, 100, 150, 300, 100, 200, 300, 100,
+                         150, 100, 300, 200, 100, 150, 300, 100, 200, 150,
+                         100, 300, 100, 150, 200, 300, 100, 150, 300, 100];
+        let mut t = start;
+        for (i, &gap_ms) in intervals.iter().enumerate() {
+            t += Duration::from_millis(gap_ms);
+            let mut flushed = pool.push(packet(i as u8), t);
+            all_bursts.append(&mut flushed);
+            if let Some(b) = pool.tick(t) {
+                all_bursts.push(b);
+            }
+        }
+        if let Some(b) = pool.flush(t + Duration::from_millis(500)) {
+            all_bursts.push(b);
+        }
+
+        let sizes: Vec<usize> = all_bursts.iter().map(|b| b.packet_count()).collect();
+        let has_singleton = sizes.iter().any(|&s| s == 1);
+        let has_multi     = sizes.iter().any(|&s| s > 1);
+
+        assert!(
+            has_singleton && has_multi,
+            "burst sizes should be variable — singletons={has_singleton}, \
+             multi={has_multi}, sizes={sizes:?}"
         );
     }
 
