@@ -79,10 +79,12 @@ pub async fn handle_client_connection(
     server: SocketAddr,
     max_read: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // No shared emitter supplied (single-connection convenience / tests): spin
-    // up a private one. Real multi-flow deployments share one across the accept
-    // loop via the `_with_lab` entry point.
-    handle_client_connection_with_lab(local, server, max_read, None, EmitterHandle::new()).await
+    // No shared emitter supplied (single-connection convenience / tests): spin up
+    // a private one and DON'T pad the tail (short-lived connections shouldn't
+    // block on padding). Real multi-flow deployments share an emitter and choose
+    // a tail policy via the `_with_lab` entry point.
+    handle_client_connection_with_lab(local, server, max_read, None, EmitterHandle::new(), TailPolicy::Off)
+        .await
 }
 
 pub async fn handle_client_connection_with_lab(
@@ -91,6 +93,7 @@ pub async fn handle_client_connection_with_lab(
     max_read: usize,
     lab: Option<Arc<LabLogger>>,
     emitter: EmitterHandle,
+    tail: TailPolicy,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let conn_id = lab.as_ref().map(|l| l.next_conn_id()).unwrap_or(0);
     let remote  = TcpStream::connect(server).await?;
@@ -105,7 +108,7 @@ pub async fn handle_client_connection_with_lab(
 
     let outbound_lab = lab.clone();
     let outbound = tokio::spawn(async move {
-        send_mixed_outbound(local_read, remote_write, max_read, outbound_lab, conn_id, emitter).await
+        send_mixed_outbound(local_read, remote_write, max_read, outbound_lab, conn_id, emitter, tail).await
     });
     let inbound = tokio::spawn(async move {
         receive_real_inbound(remote_read, local_write, lab, conn_id).await
@@ -123,10 +126,12 @@ pub async fn handle_server_connection(
     upstream: SocketAddr,
     max_read: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // No shared emitter supplied (single-connection convenience / tests): spin
-    // up a private one. Real multi-flow deployments share one across the accept
-    // loop via the `_with_lab` entry point.
-    handle_server_connection_with_lab(client, upstream, max_read, None, EmitterHandle::new()).await
+    // No shared emitter supplied (single-connection convenience / tests): spin up
+    // a private one and DON'T pad the tail (short-lived connections shouldn't
+    // block on padding). Real multi-flow deployments share an emitter and choose
+    // a tail policy via the `_with_lab` entry point.
+    handle_server_connection_with_lab(client, upstream, max_read, None, EmitterHandle::new(), TailPolicy::Off)
+        .await
 }
 
 pub async fn handle_server_connection_with_lab(
@@ -135,6 +140,7 @@ pub async fn handle_server_connection_with_lab(
     max_read: usize,
     lab: Option<Arc<LabLogger>>,
     emitter: EmitterHandle,
+    tail: TailPolicy,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let conn_id = lab.as_ref().map(|l| l.next_conn_id()).unwrap_or(0);
     let bridge  = TcpStream::connect(upstream).await?;
@@ -150,7 +156,7 @@ pub async fn handle_server_connection_with_lab(
         strip_dummies_to_bridge(client_read, bridge_write, inbound_lab, conn_id).await
     });
     let outbound = tokio::spawn(async move {
-        send_bridge_replies(bridge_read, client_write, max_read, lab, conn_id, emitter).await
+        send_bridge_replies(bridge_read, client_write, max_read, lab, conn_id, emitter, tail).await
     });
 
     tokio::select! {
@@ -212,43 +218,69 @@ const DOWNLINK_LABELS: ShapeLabels = ShapeLabels {
 // wire volume at the fixed cover rate — converge, collapsing the duration and
 // integral leaks.
 //
-// It is OFF by default: a minimum lifetime is real bandwidth+latency overhead and
-// a session-length policy the operator must opt into. `MIXTOR_TAIL_FLOOR_MS`
-// selects the policy:
-//   unset / 0   → OFF — `pad_tail` is a no-op; the connection closes on drain.
+// The policy is an explicit `TailPolicy` parameter (below). The production
+// binaries default it to `ByClass` (the duration fix is ON for a real Tor PT,
+// whose OR-connections are long-lived anyway); the no-lab/test handlers and
+// measurement tools default it to `Off` so short-lived connections don't block
+// padding. `MIXTOR_TAIL_FLOOR_MS` overrides the default in any caller:
+//   unset       → caller's default (ByClass in binaries, Off in tools/tests).
+//   "off"/"0"   → OFF — `pad_tail` is a no-op; the connection closes on drain.
 //   <N> (ms)    → fixed N-ms floor for every connection (used by tests/demos).
 //   "class"     → volume-based `SessionClass` floor: the session's real byte
 //                 count picks Short/Medium/Long (30 s / 5 min / 30 min and the
-//                 matching volume target). This is the principled production
-//                 policy — all sessions in a class converge to the same lifetime
-//                 and total volume, so neither ranks flows. See `session_bounder`.
+//                 matching volume target). All sessions in a class converge to
+//                 the same lifetime and total volume, so neither ranks flows.
 const TAIL_FLOOR_ENV: &str = "MIXTOR_TAIL_FLOOR_MS";
 const TAIL_VOLUME_QUANTUM_CELLS: u64 = 256; // ~128 KB of wire (fixed-floor mode)
 
-/// Tail-cover policy parsed from `MIXTOR_TAIL_FLOOR_MS`.
-enum TailPolicy {
+/// Tail-cover policy. Closes the session-duration / total-volume leak: without
+/// it a connection's wire lifetime tracks the session's, which a learned attack
+/// links (the uplink wire stops ~one cover interval after real traffic does).
+/// Production deployments should run `ByClass`; it is an explicit parameter
+/// (not just env) so tests and tools can keep connections short.
+#[derive(Clone, Copy, Debug)]
+pub enum TailPolicy {
+    /// No tail cover — the connection closes on drain (leaks duration).
     Off,
+    /// Pad every connection to a fixed lifetime floor (tests/demos).
     Fixed(Duration),
+    /// Volume-based `SessionClass` floor (Short/Medium/Long) — the principled
+    /// production policy: all sessions in a class converge to the same lifetime
+    /// and total wire volume, so neither ranks flows. See `session_bounder`.
     ByClass,
 }
 
-fn tail_policy() -> TailPolicy {
-    match std::env::var(TAIL_FLOOR_ENV) {
-        Ok(v) if v.eq_ignore_ascii_case("class") => TailPolicy::ByClass,
-        Ok(v) => match v.parse::<u64>() {
-            Ok(ms) if ms > 0 => TailPolicy::Fixed(Duration::from_millis(ms)),
-            _ => TailPolicy::Off,
-        },
-        Err(_) => TailPolicy::Off,
+impl TailPolicy {
+    /// Parse `MIXTOR_TAIL_FLOOR_MS`, or `None` if unset (caller picks a default):
+    /// `class` → ByClass, `off`/`0` → Off, `<N>` → Fixed(N ms).
+    pub fn from_env() -> Option<Self> {
+        match std::env::var(TAIL_FLOOR_ENV) {
+            Err(_) => None,
+            Ok(v) if v.eq_ignore_ascii_case("class") => Some(Self::ByClass),
+            Ok(v) if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") => {
+                Some(Self::Off)
+            }
+            Ok(v) => match v.parse::<u64>() {
+                Ok(0) => Some(Self::Off),
+                Ok(ms) => Some(Self::Fixed(Duration::from_millis(ms))),
+                Err(_) => None,
+            },
+        }
+    }
+
+    /// `MIXTOR_TAIL_FLOOR_MS` if set, otherwise `default`. Production binaries
+    /// pass `ByClass` (duration fix on); measurement tools/tests pass `Off`.
+    pub fn from_env_or(default: Self) -> Self {
+        Self::from_env().unwrap_or(default)
     }
 }
 
-/// The `(lifetime floor, wire-volume target in cells)` the tail should reach,
-/// or `None` when tail cover is disabled. `real_bytes_sent` selects the
-/// `SessionClass` in `ByClass` mode; `wire_seq` rounds up the volume target in
-/// `Fixed` mode.
-fn tail_targets(real_bytes_sent: u64, wire_seq: u64) -> Option<(Duration, u64)> {
-    match tail_policy() {
+/// The `(lifetime floor, wire-volume target in cells)` the tail should reach
+/// under `policy`, or `None` when tail cover is disabled. `real_bytes_sent`
+/// selects the `SessionClass` in `ByClass` mode; `wire_seq` rounds up the volume
+/// target in `Fixed` mode.
+fn tail_targets(real_bytes_sent: u64, wire_seq: u64, policy: TailPolicy) -> Option<(Duration, u64)> {
+    match policy {
         TailPolicy::Off => None,
         TailPolicy::Fixed(d) => {
             let q = TAIL_VOLUME_QUANTUM_CELLS;
@@ -329,6 +361,7 @@ async fn shaped_forward(
     conn_id: u64,
     labels: ShapeLabels,
     emitter: EmitterHandle,
+    tail: TailPolicy,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let seeds = SessionSeeds::generate()?;
     let mut session = ShapedSession::new(seeds.burst_composition(), shaped_composition_config())?;
@@ -360,7 +393,7 @@ async fn shaped_forward(
                 match r {
                     Ok(0) => {
                         drain_session(&mut session, &mut wire, &lab, conn_id, &mut wire_seq, labels.wire_event).await?;
-                        pad_tail(&mut session, &mut wire, &lab, conn_id, &mut wire_seq, labels.wire_event, session_start, real_bytes_sent).await;
+                        pad_tail(&mut session, &mut wire, &lab, conn_id, &mut wire_seq, labels.wire_event, session_start, real_bytes_sent, tail).await;
                         let _ = wire.shutdown().await;
                         return Ok(());
                     }
@@ -401,6 +434,7 @@ async fn shaped_forward(
         session_start,
         pending: Vec::new(),
         reader_done: false,
+        policy: tail,
         tail: None,
         finish_by: None,
     });
@@ -479,6 +513,8 @@ struct FlowSlot {
     pending: Vec<u8>,
     /// Set once the reader channel closes (EOF): drain the queue, then pad the tail.
     reader_done: bool,
+    /// Tail-cover policy for this flow (selects the floor at EOF).
+    policy: TailPolicy,
     /// `(lifetime floor, wire-volume target in cells)` to reach before closing,
     /// or `None` when tail cover is disabled. Computed once at reader EOF.
     tail: Option<(Duration, u64)>,
@@ -608,7 +644,7 @@ fn service_flow(flow: &mut FlowSlot) -> bool {
                         .emission_counts()
                         .0
                         .saturating_mul(CELL_PAYLOAD as u64);
-                    flow.tail = tail_targets(real_bytes, flow.wire_seq);
+                    flow.tail = tail_targets(real_bytes, flow.wire_seq, flow.policy);
                     let floor = flow.tail.map(|(f, _)| f).unwrap_or_default();
                     flow.finish_by =
                         Some(std::time::Instant::now() + floor + Duration::from_secs(5));
@@ -692,8 +728,9 @@ async fn send_mixed_outbound(
     lab: Option<Arc<LabLogger>>,
     conn_id: u64,
     emitter: EmitterHandle,
+    tail: TailPolicy,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    shaped_forward(local, remote, max_read, lab, conn_id, UPLINK_LABELS, emitter).await
+    shaped_forward(local, remote, max_read, lab, conn_id, UPLINK_LABELS, emitter, tail).await
 }
 
 /// Emit one shaped frame onto the wire, logging and tagging real vs dummy.
@@ -749,10 +786,11 @@ async fn pad_tail(
     wire_event:      &'static str,
     session_start:   std::time::Instant,
     real_bytes_sent: u64,
+    policy:          TailPolicy,
 ) {
-    let (floor, vol_target) = match tail_targets(real_bytes_sent, *wire_seq) {
+    let (floor, vol_target) = match tail_targets(real_bytes_sent, *wire_seq, policy) {
         Some(t) => t,
-        None => return, // tail cover disabled (default): close on drain
+        None => return, // tail cover disabled: close on drain
     };
     // Safety deadline: never pad more than the floor plus a small slack, so the
     // loop always terminates even if a slot somehow never fires.
@@ -862,9 +900,10 @@ async fn send_bridge_replies(
     lab:      Option<Arc<LabLogger>>,
     conn_id:  u64,
     emitter:  EmitterHandle,
+    tail:     TailPolicy,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let max_read = max_read.clamp(1, DEFAULT_MAX_FRAME_LEN);
-    shaped_forward(bridge, client, max_read, lab, conn_id, DOWNLINK_LABELS, emitter).await
+    shaped_forward(bridge, client, max_read, lab, conn_id, DOWNLINK_LABELS, emitter, tail).await
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 use clap::Parser;
 use mixtor::lab::LabLogger;
-use mixtor::transport::{handle_server_connection_with_lab, EmitterHandle};
+use mixtor::transport::{handle_server_connection_with_lab, EmitterHandle, TailPolicy};
 use std::error::Error;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -59,6 +59,10 @@ async fn run_raw_server(
 
     // One shared emitter for every flow this process clocks (see EmitterHandle).
     let emitter = EmitterHandle::new();
+    // Duration fix: production defaults to the SessionClass tail floor so a
+    // connection's lifetime/volume don't track the session. Override (incl. off)
+    // with MIXTOR_TAIL_FLOOR_MS.
+    let tail = TailPolicy::from_env_or(TailPolicy::ByClass);
     loop {
         let (client, peer) = listener.accept().await?;
         let lab = lab.clone();
@@ -66,7 +70,7 @@ async fn run_raw_server(
 
         tokio::spawn(async move {
             if let Err(error) =
-                handle_server_connection_with_lab(client, upstream, max_read, lab, emitter).await
+                handle_server_connection_with_lab(client, upstream, max_read, lab, emitter, tail).await
             {
                 eprintln!("server connection from {peer} closed: {error}");
             }
@@ -101,6 +105,7 @@ async fn run_managed_server(
 
     // One shared emitter for every flow this process clocks (see EmitterHandle).
     let emitter = EmitterHandle::new();
+    let tail = TailPolicy::from_env_or(TailPolicy::ByClass);
     loop {
         let (client, peer) = listener.accept().await?;
         let lab = lab.clone();
@@ -108,7 +113,7 @@ async fn run_managed_server(
 
         tokio::spawn(async move {
             if let Err(error) =
-                handle_server_connection_with_lab(client, upstream, max_read, lab, emitter).await
+                handle_server_connection_with_lab(client, upstream, max_read, lab, emitter, tail).await
             {
                 eprintln!("managed server connection from {peer} closed: {error}");
             }

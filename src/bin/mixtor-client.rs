@@ -1,7 +1,7 @@
 use clap::Parser;
 use mixtor::lab::LabLogger;
 use mixtor::socks::accept_socks5_connect;
-use mixtor::transport::{handle_client_connection_with_lab, EmitterHandle};
+use mixtor::transport::{handle_client_connection_with_lab, EmitterHandle, TailPolicy};
 use std::error::Error;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -64,6 +64,10 @@ async fn run_raw_client(
 
     // One shared emitter for every flow this process clocks (see EmitterHandle).
     let emitter = EmitterHandle::new();
+    // Duration fix: production defaults to the SessionClass tail floor so a
+    // connection's lifetime/volume don't track the session. Override (incl. off)
+    // with MIXTOR_TAIL_FLOOR_MS.
+    let tail = TailPolicy::from_env_or(TailPolicy::ByClass);
     loop {
         let (local, peer) = listener.accept().await?;
         let lab = lab.clone();
@@ -71,7 +75,7 @@ async fn run_raw_client(
 
         tokio::spawn(async move {
             if let Err(error) =
-                handle_client_connection_with_lab(local, server, max_read, lab, emitter).await
+                handle_client_connection_with_lab(local, server, max_read, lab, emitter, tail).await
             {
                 eprintln!("client connection from {peer} closed: {error}");
             }
@@ -104,13 +108,14 @@ async fn run_managed_client(
 
     // One shared emitter for every flow this process clocks (see EmitterHandle).
     let emitter = EmitterHandle::new();
+    let tail = TailPolicy::from_env_or(TailPolicy::ByClass);
     loop {
         let (local, peer) = listener.accept().await?;
         let lab = lab.clone();
         let emitter = emitter.clone();
 
         tokio::spawn(async move {
-            if let Err(error) = handle_managed_socks_connection(local, max_read, lab, emitter).await {
+            if let Err(error) = handle_managed_socks_connection(local, max_read, lab, emitter, tail).await {
                 eprintln!("managed client connection from {peer} closed: {error}");
             }
         });
@@ -122,9 +127,10 @@ async fn handle_managed_socks_connection(
     max_read: usize,
     lab: Option<Arc<LabLogger>>,
     emitter: EmitterHandle,
+    tail: TailPolicy,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let server = accept_socks5_connect(&mut local).await?;
-    handle_client_connection_with_lab(local, server, max_read, lab, emitter).await
+    handle_client_connection_with_lab(local, server, max_read, lab, emitter, tail).await
 }
 
 fn create_lab_logger(

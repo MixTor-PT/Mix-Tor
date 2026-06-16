@@ -317,6 +317,7 @@ mod gen {
     use mixtor::lab::LabLogger;
     use mixtor::transport::{
         handle_client_connection_with_lab, handle_server_connection_with_lab, EmitterHandle,
+        TailPolicy,
     };
     use rand::{rngs::StdRng, Rng, SeedableRng};
     use std::error::Error;
@@ -385,8 +386,12 @@ mod gen {
             let server_lab = server_lab.clone();
             tokio::spawn(async move {
                 // One shared emitter clocks every server-side flow — this is the
-                // many-flows-per-process case the unified emitter fixes.
+                // many-flows-per-process case the unified emitter fixes. The
+                // measurement tool defaults the tail floor OFF (keep runs short)
+                // but honours MIXTOR_TAIL_FLOOR_MS so the duration leak can be
+                // exercised on demand.
                 let emitter = EmitterHandle::new();
+                let tail = TailPolicy::from_env_or(TailPolicy::Off);
                 loop {
                     let Ok((client, _)) = server.accept().await else {
                         break;
@@ -395,7 +400,7 @@ mod gen {
                     let emitter = emitter.clone();
                     tokio::spawn(async move {
                         let _ = handle_server_connection_with_lab(
-                            client, bridge_addr, 1200, lab, emitter,
+                            client, bridge_addr, 1200, lab, emitter, tail,
                         )
                         .await;
                     });
@@ -411,6 +416,7 @@ mod gen {
             tokio::spawn(async move {
                 // One shared emitter clocks every client-side flow.
                 let emitter = EmitterHandle::new();
+                let tail = TailPolicy::from_env_or(TailPolicy::Off);
                 loop {
                     let Ok((app, _)) = client_listener.accept().await else {
                         break;
@@ -419,7 +425,7 @@ mod gen {
                     let emitter = emitter.clone();
                     tokio::spawn(async move {
                         let _ = handle_client_connection_with_lab(
-                            app, server_addr, 1200, lab, emitter,
+                            app, server_addr, 1200, lab, emitter, tail,
                         )
                         .await;
                     });
