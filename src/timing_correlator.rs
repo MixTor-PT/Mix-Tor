@@ -58,10 +58,27 @@
 
 use crate::composition::MixedFrame;
 use crate::clumping::Packet;
-use rand::Rng;
+use rand::{Rng, RngCore};
+use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Debug instrumentation (process-global): total departure slots fired, and the
+/// number of scheduled slots abandoned by the `MAX_CATCHUP_LAG` clamp. If the
+/// emitter keeps up these stay ~0; a nonzero drop count that tracks load means
+/// the cover rate is being modulated by scheduling. Read via `catchup_stats`.
+pub static SLOTS_FIRED: AtomicU64 = AtomicU64::new(0);
+pub static SLOTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// `(slots_fired, slots_dropped)` since process start.
+pub fn catchup_stats() -> (u64, u64) {
+    (
+        SLOTS_FIRED.load(Ordering::Relaxed),
+        SLOTS_DROPPED.load(Ordering::Relaxed),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -196,7 +213,13 @@ impl TimingCorrelatorConfig {
 #[derive(Debug)]
 pub struct TimingCorrelator {
     config: TimingCorrelatorConfig,
+    /// RNG for the departure CLOCK only (`exponential_sample` + `force_dummy`).
+    /// Advanced a FIXED amount per slot regardless of real/dummy, so the IAT
+    /// sequence never depends on payload content.
     rng: ChaCha20Rng,
+    /// Separate RNG for dummy PAYLOAD bytes, so filling them doesn't perturb the
+    /// clock RNG (see `make_dummy_frame`).
+    content_rng: ChaCha20Rng,
 
     /// Queue of real packets waiting to be emitted.  Packets are emitted in
     /// FIFO order; each dequeue replaces one dummy slot.
@@ -222,12 +245,18 @@ pub struct TimingCorrelator {
 }
 
 impl TimingCorrelator {
-    pub fn new(config: TimingCorrelatorConfig, rng: ChaCha20Rng) -> Result<Self, TimingCorrelatorError> {
+    pub fn new(config: TimingCorrelatorConfig, mut rng: ChaCha20Rng) -> Result<Self, TimingCorrelatorError> {
         let config = config.validate()?;
         let mean_iat_ms = config.initial_iat_ms;
+        // Derive an independent content RNG so dummy-payload fills never advance
+        // the clock RNG (keeps the departure schedule independent of content).
+        let mut content_seed = [0u8; 32];
+        rng.fill_bytes(&mut content_seed);
+        let content_rng = ChaCha20Rng::from_seed(content_seed);
         let mut tc = Self {
             config,
             rng,
+            content_rng,
             real_queue: VecDeque::new(),
             next_departure: Instant::now(),
             mean_iat_ms,
@@ -403,7 +432,12 @@ impl TimingCorrelator {
         // starvation, a long stall), drop the accumulated debt so we never emit
         // a large make-up burst — that burst would itself be a timing artefact.
         const MAX_CATCHUP_LAG: Duration = Duration::from_millis(200);
+        SLOTS_FIRED.fetch_add(1, Ordering::Relaxed);
         self.next_departure = if candidate + MAX_CATCHUP_LAG < now {
+            // Count the slots we are abandoning (debug instrumentation).
+            let lost = now.saturating_duration_since(candidate).as_micros() as u64
+                / step.as_micros().max(1) as u64;
+            SLOTS_DROPPED.fetch_add(lost.max(1), Ordering::Relaxed);
             now + step
         } else {
             candidate
@@ -442,10 +476,20 @@ impl TimingCorrelator {
         }
     }
 
-    /// Build a `MixedFrame::Dummy` of exactly `cell_bytes` random bytes.
+    /// Build a `MixedFrame::Dummy` of exactly `cell_bytes` bytes.
+    ///
+    /// The dummy payload is NOT drawn from `self.rng`: that RNG also drives the
+    /// departure clock (`exponential_sample`) and the `force_dummy` coin, so
+    /// consuming a variable number of its outputs per frame (a real frame draws
+    /// none, a dummy ~`cell_bytes`) made the clock's IAT sequence depend on the
+    /// real/dummy pattern — a content→timing coupling. A separate cheap RNG keeps
+    /// the payload random-looking while leaving the clock RNG advanced by a fixed
+    /// amount per slot regardless of content. (On the wire the deployment's
+    /// encryption randomises payloads anyway; this fill is for the unencrypted
+    /// lab path only.)
     fn make_dummy_frame(&mut self) -> MixedFrame {
         let mut bytes = vec![0u8; self.config.cell_bytes];
-        self.rng.fill(bytes.as_mut_slice());
+        self.content_rng.fill(bytes.as_mut_slice());
         MixedFrame::Dummy(bytes)
     }
 

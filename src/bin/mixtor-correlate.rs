@@ -450,6 +450,11 @@ mod gen {
 
         // Give the proxies a moment to flush trailing cover/logs.
         tokio::time::sleep(Duration::from_millis(500)).await;
+        let (fired, dropped) = mixtor::timing_correlator::catchup_stats();
+        eprintln!(
+            "emitter slots: fired {fired}  dropped(catch-up) {dropped}  ({:.2}% dropped)",
+            if fired > 0 { 100.0 * dropped as f64 / fired as f64 } else { 0.0 }
+        );
         eprintln!("wrote server.csv and client.csv to {}", dir.display());
         eprintln!(
             "now run:  mixtor-correlate analyze {}/server.csv --direction both --skip-ms 1500",
