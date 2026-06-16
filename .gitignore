@@ -1,2 +1,9 @@
 /target/
 *.pdb
+
+# generated correlation datasets / captures (regenerable, large)
+localtest/dl/data*/
+localtest/**/run*/
+localtest/**/*.csv
+.VSCodeCounter/
+.claude/settings.local.json

@@ -1,7 +1,7 @@
 use clap::Parser;
 use mixtor::lab::LabLogger;
 use mixtor::socks::accept_socks5_connect;
-use mixtor::transport::handle_client_connection_with_lab;
+use mixtor::transport::{handle_client_connection_with_lab, EmitterHandle};
 use std::error::Error;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -62,13 +62,16 @@ async fn run_raw_client(
         server
     );
 
+    // One shared emitter for every flow this process clocks (see EmitterHandle).
+    let emitter = EmitterHandle::new();
     loop {
         let (local, peer) = listener.accept().await?;
         let lab = lab.clone();
+        let emitter = emitter.clone();
 
         tokio::spawn(async move {
             if let Err(error) =
-                handle_client_connection_with_lab(local, server, max_read, lab).await
+                handle_client_connection_with_lab(local, server, max_read, lab, emitter).await
             {
                 eprintln!("client connection from {peer} closed: {error}");
             }
@@ -99,12 +102,15 @@ async fn run_managed_client(
 
     eprintln!("mixtor-client managed SOCKS5 listener on {addr}");
 
+    // One shared emitter for every flow this process clocks (see EmitterHandle).
+    let emitter = EmitterHandle::new();
     loop {
         let (local, peer) = listener.accept().await?;
         let lab = lab.clone();
+        let emitter = emitter.clone();
 
         tokio::spawn(async move {
-            if let Err(error) = handle_managed_socks_connection(local, max_read, lab).await {
+            if let Err(error) = handle_managed_socks_connection(local, max_read, lab, emitter).await {
                 eprintln!("managed client connection from {peer} closed: {error}");
             }
         });
@@ -115,9 +121,10 @@ async fn handle_managed_socks_connection(
     mut local: TcpStream,
     max_read: usize,
     lab: Option<Arc<LabLogger>>,
+    emitter: EmitterHandle,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let server = accept_socks5_connect(&mut local).await?;
-    handle_client_connection_with_lab(local, server, max_read, lab).await
+    handle_client_connection_with_lab(local, server, max_read, lab, emitter).await
 }
 
 fn create_lab_logger(

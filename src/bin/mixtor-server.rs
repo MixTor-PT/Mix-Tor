@@ -1,6 +1,6 @@
 use clap::Parser;
 use mixtor::lab::LabLogger;
-use mixtor::transport::handle_server_connection_with_lab;
+use mixtor::transport::{handle_server_connection_with_lab, EmitterHandle};
 use std::error::Error;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -57,13 +57,16 @@ async fn run_raw_server(
         upstream
     );
 
+    // One shared emitter for every flow this process clocks (see EmitterHandle).
+    let emitter = EmitterHandle::new();
     loop {
         let (client, peer) = listener.accept().await?;
         let lab = lab.clone();
+        let emitter = emitter.clone();
 
         tokio::spawn(async move {
             if let Err(error) =
-                handle_server_connection_with_lab(client, upstream, max_read, lab).await
+                handle_server_connection_with_lab(client, upstream, max_read, lab, emitter).await
             {
                 eprintln!("server connection from {peer} closed: {error}");
             }
@@ -96,13 +99,16 @@ async fn run_managed_server(
 
     eprintln!("mixtor-server managed listener on {addr}, upstream {upstream}");
 
+    // One shared emitter for every flow this process clocks (see EmitterHandle).
+    let emitter = EmitterHandle::new();
     loop {
         let (client, peer) = listener.accept().await?;
         let lab = lab.clone();
+        let emitter = emitter.clone();
 
         tokio::spawn(async move {
             if let Err(error) =
-                handle_server_connection_with_lab(client, upstream, max_read, lab).await
+                handle_server_connection_with_lab(client, upstream, max_read, lab, emitter).await
             {
                 eprintln!("managed server connection from {peer} closed: {error}");
             }

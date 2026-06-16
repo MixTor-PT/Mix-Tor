@@ -12,7 +12,7 @@ getrandom = "0.2"
 rand = "0.8"
 rand_chacha = "0.3"
 rand_distr = "0.4"
-tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]

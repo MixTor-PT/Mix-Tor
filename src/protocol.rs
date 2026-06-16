@@ -62,6 +62,19 @@ impl WireFrame {
     pub fn into_payload(self) -> Vec<u8> {
         self.payload
     }
+
+    /// Serialize to the on-wire bytes (header + payload) — the same bytes
+    /// `write_frame` emits. Lets a caller batch frames and write them with a
+    /// single non-blocking `try_write` (used by the unified emitter).
+    pub fn encode(&self) -> Vec<u8> {
+        let len = self.payload.len() as u32; // new() bounds payload <= DEFAULT_MAX_FRAME_LEN
+        let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len());
+        out.extend_from_slice(MAGIC);
+        out.push(self.kind as u8);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&self.payload);
+        out
+    }
 }
 
 pub async fn write_frame<W>(writer: &mut W, frame: &WireFrame) -> Result<(), ProtocolError>
