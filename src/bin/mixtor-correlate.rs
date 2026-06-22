@@ -314,6 +314,7 @@ fn verdict(adversary_succeeded: bool, on_success: &str, on_fail: &str) {
 // without a live Tor bridge.
 
 mod gen {
+    use mixtor::crypto::StaticKeypair;
     use mixtor::lab::LabLogger;
     use mixtor::transport::{
         handle_client_connection_with_lab, handle_server_connection_with_lab, EmitterHandle,
@@ -338,6 +339,11 @@ mod gen {
     async fn run(dir: PathBuf, flow_count: usize, bursts: usize) -> Result<(), Box<dyn Error>> {
         let server_lab = LabLogger::create(&dir, "server")?;
         let client_lab = LabLogger::create(&dir, "client")?;
+
+        // A single bridge identity for this sample run: the server proves it,
+        // the client verifies it.
+        let identity = Arc::new(StaticKeypair::generate());
+        let server_pub = identity.public_bytes();
 
         // Web-like "bridge": each request is amplified into a larger reply so
         // the download path carries the bulk. A per-connection factor gives each
@@ -384,6 +390,7 @@ mod gen {
         let server_addr = server.local_addr()?;
         {
             let server_lab = server_lab.clone();
+            let identity = identity.clone();
             tokio::spawn(async move {
                 // One shared emitter clocks every server-side flow — this is the
                 // many-flows-per-process case the unified emitter fixes. The
@@ -398,9 +405,11 @@ mod gen {
                     };
                     let lab = Some(server_lab.clone());
                     let emitter = emitter.clone();
+                    let tail = tail.clone();
+                    let identity = identity.clone();
                     tokio::spawn(async move {
                         let _ = handle_server_connection_with_lab(
-                            client, bridge_addr, 1200, lab, emitter, tail,
+                            client, bridge_addr, 1200, lab, emitter, tail, identity, None,
                         )
                         .await;
                     });
@@ -423,9 +432,10 @@ mod gen {
                     };
                     let lab = Some(client_lab.clone());
                     let emitter = emitter.clone();
+                    let tail = tail.clone();
                     tokio::spawn(async move {
                         let _ = handle_client_connection_with_lab(
-                            app, server_addr, 1200, lab, emitter, tail,
+                            app, server_addr, 1200, lab, emitter, tail, server_pub,
                         )
                         .await;
                     });
@@ -500,11 +510,9 @@ mod gen {
             }
         });
 
-        // Warmup: trickle ~70 KB in small RTT-paced chunks (not an instant dump)
-        // so we clear WARMUP_BYTES (64 KB) while modelling a real handshake's
-        // round-trip pacing. Real cells go out immediately for low setup latency;
-        // the transport's warmup credit keeps the cover from piling on top, so
-        // this window now sits at the steady cover rate rather than spiking.
+        // Startup: trickle ~70 KB in small RTT-paced chunks (not an instant dump)
+        // to model a real Tor link handshake's round-trip pacing before the bulk
+        // download begins.
         let warm = vec![0xABu8; 2560];
         for _ in 0..28 {
             wr.write_all(&warm).await?;

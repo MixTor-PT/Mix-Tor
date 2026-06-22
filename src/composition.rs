@@ -763,13 +763,19 @@ impl SeedBComposer {
         let mut dummy_gaps = vec![0usize; real_packets.len() + 1];
         let mut remaining  = dummy_packets;
 
-        // Fix item 2: randomise leading/trailing split for singletons.
-        if real_packets.len() == 1 && remaining > 0 {
-            let guaranteed = remaining.min(2);
-            let leading    = self.rng.gen_range(0..=guaranteed);
-            dummy_gaps[0] += leading;
-            dummy_gaps[1] += guaranteed - leading;
-            remaining     -= guaranteed;
+        // Fix item 2: place a lone real packet at a UNIFORMLY random position
+        // among the dummies.  Distributing each dummy front/back with the
+        // per-gap draw below (the multi-packet path) would make a singleton's
+        // index Binomial(D, ½) — concentrated near the middle of the burst,
+        // which is itself a fingerprint (and makes the first/last positions
+        // exponentially rare).  Drawing the leading count uniformly from
+        // [0, remaining] makes every index — first, middle, last — equally
+        // likely.
+        if real_packets.len() == 1 {
+            let leading = self.rng.gen_range(0..=remaining);
+            dummy_gaps[0] = leading;
+            dummy_gaps[1] = remaining - leading;
+            remaining = 0;
         }
 
         for _ in 0..remaining {
@@ -1018,6 +1024,13 @@ impl ShapedSession {
         self.correlator.next_departure()
     }
 
+    /// Restart the departure clock from now (see
+    /// `TimingCorrelator::restart_clock`). The emitter calls this on first
+    /// service so the creation→service gap doesn't drain as a startup burst.
+    pub fn restart_clock(&mut self) {
+        self.correlator.restart_clock();
+    }
+
     /// True when a frame is ready to emit right now.
     pub fn slot_ready(&self) -> bool {
         self.correlator.slot_ready()
@@ -1182,11 +1195,18 @@ mod tests {
         }
     }
 
-    /// Config for `ShapedSession` tests — uniform 514-byte cells.
+    /// Config for `ShapedSession` tests — uniform 514-byte cells with a fast
+    /// departure clock so a test can observe emitted frames within a short
+    /// wall-clock window.  The clock_* params drive the `TimingCorrelator`
+    /// directly; `max_idle_gap_ms` (inherited as 2500) only feeds the spectral
+    /// IAT generator, which requires `floor_ms (10) < ceiling_ms (2*gap)`.
     fn shaped_config() -> CompositionConfig {
         CompositionConfig {
-            cell_bytes: Some(TOR_CELL_BYTES),
-            dp_shaper:  None,
+            cell_bytes:           Some(TOR_CELL_BYTES),
+            dp_shaper:            None,
+            clock_initial_iat_ms: Some(1.0),
+            clock_min_iat_ms:     Some(1.0),
+            clock_max_iat_ms:     Some(5.0),
             ..fast_switch_config()
         }
     }
@@ -1418,7 +1438,7 @@ mod tests {
         session.inject_real(packet(0xAB, 100)).unwrap();
 
         let mut frames = Vec::new();
-        let deadline = Instant::now() + Duration::from_millis(100);
+        let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
             if let Some(f) = session.tick() {
                 frames.push(f);
@@ -1426,7 +1446,7 @@ mod tests {
             std::hint::spin_loop();
         }
 
-        assert!(!frames.is_empty(), "should have emitted frames within 100ms");
+        assert!(!frames.is_empty(), "should have emitted frames within 500ms");
         for f in &frames {
             assert_eq!(
                 f.len(),
@@ -1439,21 +1459,15 @@ mod tests {
     #[test]
     fn shaped_session_real_replaces_dummy_slot() {
         let seeds = SessionSeeds::generate().unwrap();
-        let mut session = ShapedSession::new(
-            seeds.burst_composition(),
-            CompositionConfig {
-                cell_bytes:      Some(514),
-                max_idle_gap_ms: 5, // fast slots for test
-                ..shaped_config()
-            },
-        )
-        .unwrap();
+        // shaped_config() already supplies a fast (~1ms) clock; no need to
+        // shrink max_idle_gap_ms (which would invalidate the spectral config).
+        let mut session = ShapedSession::new(seeds.burst_composition(), shaped_config()).unwrap();
 
         session.inject_real(packet(0xCC, 200)).unwrap();
 
         // Spin until we get a real frame.
         let mut got_real = false;
-        let deadline = Instant::now() + Duration::from_millis(100);
+        let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline && !got_real {
             if let Some(f) = session.tick() {
                 if f.is_real() {

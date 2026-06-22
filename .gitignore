@@ -1,9 +1,69 @@
 /target/
 *.pdb
 
+# Local Tor PT test-harness runtime state. NEVER COMMIT.
+# Tor DataDirectories hold SECRET KEYS (secret_id_key, secret_onion_key),
+# the ExtORPort auth cookie, the persisted mixtor bridge identity, logs, and
+# generated torrc. None of this belongs in the repo.
+localtest/bridge-data/
+localtest/client-data/
+localtest/client-data-*/
+localtest/real-logs/
+localtest/*.log
+localtest/torrc-*
+localtest/*.gen
+localtest/mixtor_identity
+localtest/*.key
+**/mixtor_identity
+
 # generated correlation datasets / captures (regenerable, large)
 localtest/dl/data*/
+localtest/dl/enc-*/
+localtest/adv-*/
 localtest/**/run*/
 localtest/**/*.csv
+
+# Live bridge runtime. Tor DataDirectory (secret_id_key, secret_onion_key*),
+# the persisted MixTor identity.key, consensus caches, and logs. Holds SECRETS.
+localtest/bridge-live/
+localtest/**/keys/
+**/secret_id_key
+**/secret_onion_key
+**/secret_onion_key_ntor
+
+# Other generated localtest runtime: dataset dirs, harness output, py caches.
+localtest/dl-*/
+localtest/iso-*/
+localtest/sweep/
+localtest/wm-*/
+localtest/*.out
+__pycache__/
+*.pyc
+
+# AI assistant / agent tool artifacts. Keep them out of a published repo.
+.codex/
+codex.md
+AGENTS.md
+.cursor/
+.cursorrules
+.cursorignore
+.aider*
+.continue/
+.windsurf/
+.windsurfrules
+GEMINI.md
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.github/copilot-instructions.md
+
+# OS and editor junk
 .VSCodeCounter/
-.claude/settings.local.json
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~

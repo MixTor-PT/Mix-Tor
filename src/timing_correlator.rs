@@ -369,6 +369,21 @@ impl TimingCorrelator {
         Instant::now() >= self.next_departure
     }
 
+    /// Restart the departure clock from *now*, discarding any slots that came
+    /// due between construction and this call. The shared emitter calls this
+    /// the first time it services a flow: otherwise the gap between session
+    /// creation and first service leaves several slots overdue, and the
+    /// `while slot_ready()` catch-up drain emits them as a startup burst. With
+    /// pull-per-slot that burst pulls as many queued real cells as are waiting,
+    /// so its size tracks the real data already buffered — a per-flow startup
+    /// timing leak (measured: avg per-flow Pearson(wire,real) +0.18 in the first
+    /// 1.5 s, ~0 after). Resetting the clock makes the first slot fire one fresh
+    /// interval from now, so no startup burst forms.
+    pub fn restart_clock(&mut self) {
+        self.next_departure = Instant::now();
+        self.advance_clock();
+    }
+
     /// Current queue depth (real packets waiting to be emitted).
     pub fn queue_depth(&self) -> usize {
         self.real_queue.len()
@@ -536,21 +551,6 @@ pub fn drain_ready(tc: &mut TimingCorrelator) -> Vec<MixedFrame> {
 // Packet extension trait
 // ---------------------------------------------------------------------------
 
-/// Extension trait to move bytes out of a `Packet` for padding.
-///
-/// `Packet` is defined in `crate::clumping` and doesn't expose a
-/// consuming-bytes method directly, so we re-use `bytes()` and clone.
-/// In a real codebase this would be an `into_bytes()` on Packet itself.
-trait PacketExt {
-    fn into_bytes(self) -> Vec<u8>;
-}
-
-impl PacketExt for Packet {
-    fn into_bytes(self) -> Vec<u8> {
-        self.bytes().to_vec()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -634,16 +634,19 @@ mod tests {
         )
         .unwrap();
 
-        // Spin until we get a frame (should be nearly instant at 1ms IAT).
+        // Spin (wall-clock bounded) until the first slot fires. A fixed spin
+        // COUNT is unreliable: 10k empty iterations can elapse in well under the
+        // 1–5ms first-slot delay, so the loop finishes before any slot is ready.
         let mut frame = None;
-        for _ in 0..10_000 {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
             if let Some(f) = tc.tick() {
                 frame = Some(f);
                 break;
             }
             std::hint::spin_loop();
         }
-        let frame = frame.expect("should have emitted a frame within 10k spins");
+        let frame = frame.expect("should have emitted a frame within 200ms");
         assert!(frame.is_dummy(), "empty queue must produce a dummy frame");
         assert_eq!(frame.len(), 514, "dummy must be exactly cell_bytes");
     }
@@ -669,9 +672,11 @@ mod tests {
         tc.inject_real(pkt(0xAB)).unwrap();
         assert_eq!(tc.queue_depth(), 1);
 
-        // Spin until the first slot fires.
+        // Spin (wall-clock bounded) until the first slot fires — a fixed spin
+        // count can elapse before the 1–5ms first-slot delay.
         let mut frame = None;
-        for _ in 0..10_000 {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
             if let Some(f) = tc.tick() {
                 frame = Some(f);
                 break;

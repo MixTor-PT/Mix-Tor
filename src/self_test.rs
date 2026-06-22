@@ -368,12 +368,24 @@ mod tests {
     fn good_output_passes_tests() {
         let mut tester = SelfTester::new(SelfTestConfig::default());
         let mut now = 0u64;
-        // Alternate real and dummy frames with similar sizes.
-        for i in 0usize..100 {
-            now += (100 + (i * 7 % 50)) as u64; // irregular intervals (no periodicity)
-            tester.record_frame(&real_frame(800 + (i * 13 % 200)), now);
-            now += 1;
-            tester.record_frame(&dummy_frame(900 + (i * 7 % 200)), now);
+        // Emit frames at genuinely aperiodic intervals (a deterministic LCG
+        // gives white-ish, low-autocorrelation IATs — like the shaper's Poisson
+        // departure clock).  The previous version advanced `now` by exactly 1ms
+        // between each real/dummy pair, which created a strict period-2 IAT
+        // oscillation [~120, 1, ~120, 1, …]: lag-1 autocorrelation ≈ −1 and a
+        // sharp Nyquist spectral peak — both legitimately flagged.
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for i in 0usize..200 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let iat = 50 + (state >> 40) % 150; // aperiodic IAT in [50, 200) ms
+            now += iat;
+            if i % 2 == 0 {
+                tester.record_frame(&real_frame(800 + (i * 13 % 200)), now);
+            } else {
+                tester.record_frame(&dummy_frame(900 + (i * 7 % 200)), now);
+            }
         }
         let result = tester.run_tests();
         // Should not fail autocorrelation or spectral tests for irregular frames.
@@ -396,9 +408,17 @@ mod tests {
             dummy_ratio_min: 0.0,               // don't fail on ratio
             ..SelfTestConfig::default()
         });
-        // Perfectly periodic frames at 100ms intervals.
+        // A periodic-but-varying IAT pattern (period 10) concentrates spectral
+        // power in a single DFT bin, which the detector must flag.  Note: a
+        // *constant* IAT will NOT trip this test — after mean removal it is
+        // identically zero, so the mean-removed DFT has no power anywhere; that
+        // degenerate case has zero AC energy and is a different failure mode.
+        let mut now = 0u64;
         for i in 0..200u64 {
-            tester.record_frame(&dummy_frame(500), i * 100);
+            let phase = (i % 10) as f64 / 10.0 * 2.0 * std::f64::consts::PI;
+            let iat = (100.0 + 60.0 * phase.sin()).round() as u64;
+            now += iat;
+            tester.record_frame(&dummy_frame(500), now);
         }
         let result = tester.run_tests();
         let has_spectral = result

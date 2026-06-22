@@ -9,8 +9,8 @@
 pub mod clumping;
 pub mod composition;
 pub mod correlation_attack;
+pub mod crypto;
 pub mod lab;
-pub mod protocol;
 pub mod seeds;
 pub mod socks;
 pub mod timing;

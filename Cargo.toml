@@ -1,18 +1,22 @@
 [package]
 name = "mixtor"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "MixTor pluggable transport core components."
 
 [dependencies]
 blake3 = "1.5"
-clap = { version = "4.5", features = ["derive"] }
+chacha20poly1305 = "0.10"
+clap = { version = "4.5", features = ["derive", "env"] }
+curve25519-elligator2 = "0.1.0-alpha.2"
 getrandom = "0.2"
 rand = "0.8"
 rand_chacha = "0.3"
 rand_distr = "0.4"
+subtle = "2"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
